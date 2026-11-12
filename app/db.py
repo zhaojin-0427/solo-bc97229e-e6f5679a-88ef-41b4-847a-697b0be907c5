@@ -34,8 +34,9 @@ CREATE TABLE IF NOT EXISTS batches (
 CREATE UNIQUE INDEX IF NOT EXISTS one_active_full_load
     ON batches(kind) WHERE kind = 'full' AND status IN ('loading', 'staging_ready');
 
--- 正式结果表:撤回的行保留为墓碑(active=0),记录撤回修订号,
--- 使“旧修订不得恢复结果”的规则在基线切换后仍然成立。
+-- 正式结果表:撤回的行保留为墓碑(active=0),记录撤回修订号;
+-- 全量缺失但被撤回过的项目也保留为纯水位行(result=NULL, revision=0),
+-- 使“旧修订不得恢复结果”的规则在基线切换、结果恢复与重启后仍然成立。
 CREATE TABLE IF NOT EXISTS results (
     report_no     TEXT NOT NULL,
     item          TEXT NOT NULL,

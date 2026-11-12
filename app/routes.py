@@ -12,6 +12,7 @@ bp = Blueprint("main", __name__)
 SAMPLE_FILES = {
     "full_baseline": "full_baseline.csv",
     "full_baseline_v2": "full_baseline_v2.csv",
+    "full_baseline_v3": "full_baseline_v3.csv",
     "full_large": "full_baseline_large.csv",
     "inc_corrections": "inc_corrections.csv",
     "inc_withdrawals": "inc_withdrawals.csv",

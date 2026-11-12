@@ -196,6 +196,65 @@ def test_tombstone_carries_across_baseline_switch(app, client):
     assert ("X", "铅") not in active_map(app)
 
 
+def test_ceiling_survives_restore_then_full_with_old_revision(app, client):
+    """撤回3 -> 修订4恢复 -> 含修订2的全量:修订2不得复活,水位继续生效。"""
+    csv_upload(client, [("R1", "铅", "0.1", 1)])
+    finish_pending(app)
+    csv_upload(client, [("R1", "铅", "withdraw", "", 3)], kind="inc")
+    csv_upload(client, [("R1", "铅", "correct", "0.4", 4)], kind="inc")   # 更高修订恢复
+    assert active_map(app)[("R1", "铅")] == ("0.4", 4)
+    csv_upload(client, [("R1", "铅", "0.2", 2)])                          # 全量含旧修订2
+    finish_pending(app)
+    assert ("R1", "铅") not in active_map(app)          # 修订2不得成为有效结果
+    # 水位跨切换保留:<=3 的增量仍无效,更高修订仍可生效
+    csv_upload(client, [("R1", "铅", "correct", "0.3", 3)], kind="inc")
+    assert ("R1", "铅") not in active_map(app)
+    csv_upload(client, [("R1", "铅", "correct", "0.5", 5)], kind="inc")
+    assert active_map(app)[("R1", "铅")] == ("0.5", 5)
+
+
+def test_ceiling_survives_missing_item_switch_and_restart(app, client):
+    """全量缺失该项目:结果移除但水位保留;重启后旧修订增量不得恢复。"""
+    csv_upload(client, [("R1", "铅", "0.1", 1), ("R2", "镉", "0.2", 1)])
+    finish_pending(app)
+    csv_upload(client, [("R1", "铅", "withdraw", "", 3)], kind="inc")
+    csv_upload(client, [("R1", "铅", "correct", "0.4", 4)], kind="inc")
+    assert active_map(app)[("R1", "铅")] == ("0.4", 4)
+    csv_upload(client, [("R2", "镉", "0.2", 1)])        # 新全量缺少 R1
+    finish_pending(app)
+    assert ("R1", "铅") not in active_map(app)          # 结果仍被移除
+    assert active_map(app)[("R2", "镉")] == ("0.2", 1)
+    # 模拟重启:同数据目录新建应用并恢复
+    app2 = create_app({"TESTING": True, "DATA_DIR": app.config["DATA_DIR"],
+                       "SAMPLES_DIR": app.config["SAMPLES_DIR"],
+                       "CHUNK_SIZE": 3, "CHUNK_DELAY": 0.0})
+    loader.run_pending(app2.config["DATA_DIR"], 3)
+    # 不高于水位的增量不得恢复结果
+    csv_upload(client, [("R1", "铅", "correct", "0.2", 2)], kind="inc")
+    assert ("R1", "铅") not in active_map(app)
+    csv_upload(client, [("R1", "铅", "correct", "0.3", 3)], kind="inc")
+    assert ("R1", "铅") not in active_map(app)
+    # 更高修订仍可生效
+    csv_upload(client, [("R1", "铅", "correct", "0.5", 5)], kind="inc")
+    assert active_map(app)[("R1", "铅")] == ("0.5", 5)
+
+
+def test_ceiling_survives_consecutive_full_switches(app, client):
+    """连续全量切换:更高修订的全量恢复结果不清除水位,后续旧修订全量仍无效。"""
+    csv_upload(client, [("R1", "铅", "0.1", 1)])
+    finish_pending(app)
+    csv_upload(client, [("R1", "铅", "withdraw", "", 3)], kind="inc")
+    csv_upload(client, [("R1", "铅", "correct", "0.4", 4)], kind="inc")
+    csv_upload(client, [("R1", "铅", "0.5", 5)])        # 第一次切换:全量 rev5 合法恢复
+    finish_pending(app)
+    assert active_map(app)[("R1", "铅")] == ("0.5", 5)
+    csv_upload(client, [("R1", "铅", "0.2", 2)])        # 第二次切换:全量 rev2 不得生效
+    finish_pending(app)
+    assert ("R1", "铅") not in active_map(app)
+    csv_upload(client, [("R1", "铅", "correct", "0.6", 6)], kind="inc")   # 更高修订仍生效
+    assert active_map(app)[("R1", "铅")] == ("0.6", 6)
+
+
 # ---------------------------------------------------------------- 断点续传与恢复
 
 def test_crash_during_full_load_resumes_without_losing_increments(app, client, tmp_path):
@@ -417,3 +476,17 @@ def test_sample_files_end_to_end(app, client):
     assert ("R2026-0004", "砷(As)") not in m            # 墓碑承继:旧修订不复活
     assert m[("R2026-0008", "铅(Pb)")] == ("0.095", 2)  # 新修订合法恢复
     assert m[("R2026-0005", "镉(Cd)")] == ("0.09", 4)
+    # 基线 v3 切换:撤回水位在“恢复后”仍跨切换保留
+    client.post("/load_sample/full_baseline_v3")
+    finish_pending(app)
+    m = active_map(app)
+    assert ("R2026-0005", "镉(Cd)") not in m            # 曾撤回3恢复4,全量 rev2 <= 水位 -> 不复活
+    assert ("R2026-0009", "铅(Pb)") not in m            # 全量缺失 -> 移除
+    assert ("R2026-0004", "砷(As)") not in m            # 墓碑继续承继
+    assert m[("R2026-0001", "铅(Pb)")] == ("0.12", 4)   # 更高修订正常生效
+    assert m[("R2026-0008", "铅(Pb)")] == ("0.095", 2)  # rev2 > 水位1,保持有效
+    # 水位仍在:rev3(=水位)增量不能恢复,rev4(>水位)可以
+    csv_upload(client, [("R2026-0005", "镉(Cd)", "correct", "0.08", 3)], kind="inc")
+    assert ("R2026-0005", "镉(Cd)") not in active_map(app)
+    csv_upload(client, [("R2026-0005", "镉(Cd)", "correct", "0.09", 4)], kind="inc")
+    assert active_map(app)[("R2026-0005", "镉(Cd)")] == ("0.09", 4)

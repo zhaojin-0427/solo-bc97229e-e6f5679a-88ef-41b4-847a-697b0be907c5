@@ -4,7 +4,10 @@
   - 更正:仅当 新修订号 > 当前生效修订号 且 > 已撤回修订号 时生效;
     即“同报告同项目取最高修订”,且“撤回后旧修订不能恢复结果”。
   - 撤回:记录 withdrawn_rev = max(撤回修订号);若撤回修订号 >= 当前
-    生效修订号,则结果失效(墓碑)。墓碑跨基线保留,防止旧修订复活。
+    生效修订号,则结果失效(墓碑)。
+  - 撤回修订上限(withdrawn_rev)跨连续全量切换与进程重启保留;
+    曾用更高修订恢复结果也不会清除它。不高于该上限的全量行或增量
+    一律不得成为有效结果,更高修订仍可生效。
 """
 import csv
 
@@ -201,13 +204,22 @@ def merge_and_switch(conn, batch_id):
         raise RuntimeError(f"全量批次不存在: {batch_id}")
     start_seq = batch["start_seq"]
 
-    # 1) 旧正式表中的撤回墓碑承继到暂存区:
-    #    暂存区修订 <= 撤回水位 => 保持失效;缺失的键保留墓碑,杜绝旧修订复活。
+    # 1) 旧正式表中的撤回水位承继到暂存区(跨基线保留,杜绝旧修订复活):
+    #    - 墓碑行(active=0):整行承继(结果本已为 NULL);
+    #    - 曾撤回但已用更高修订恢复的行(active=1 且 withdrawn_rev>0):
+    #      仅承继水位,生成纯水位行(result=NULL, revision=0)——全量缺失
+    #      该项目时结果仍被移除,但水位保留,后续不高于水位的全量/增量均无效;
+    #    - 暂存区已有该键(全量文件含该项目):水位并入暂存行,
+    #      暂存修订 <= 水位 => 失效;> 水位 => 生效且继续携带水位。
     conn.execute(
         """
         INSERT INTO results_staging (report_no, item, result, revision, withdrawn_rev, active)
-        SELECT report_no, item, result, revision, withdrawn_rev, active
-          FROM results WHERE active = 0
+        SELECT report_no, item,
+               CASE WHEN active = 1 THEN NULL ELSE result END,
+               CASE WHEN active = 1 THEN 0 ELSE revision END,
+               withdrawn_rev, 0
+          FROM results
+         WHERE active = 0 OR withdrawn_rev > 0
         ON CONFLICT(report_no, item) DO UPDATE SET
             withdrawn_rev = MAX(results_staging.withdrawn_rev, excluded.withdrawn_rev),
             active = CASE WHEN excluded.withdrawn_rev >= results_staging.revision
